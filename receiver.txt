@@ -1,0 +1,822 @@
+/*
+╔════════════════════════════════════════════════════════════════╗
+║  ARIA v4.0.1 — RECEIVER UNIT (Arduino Uno)                    ║
+║  Li-Fi decoder (5-bit parity) + DFPlayer + Buzzer + RELAY     ║
+║                                                                ║
+║  🔧 UPDATES IN v4.0.1:                                         ║
+║    • Emergency code corrected: 0b1111 → 0b1101                ║
+║    • 5-bit parity validation added                            ║
+║    • Relay debounce bug FIXED (increments per code, not loop) ║
+║    • Signal quality tracking enhanced                         ║
+║                                                                ║
+║  ✅ VERIFIED: Relay module is ACTIVE-LOW                       ║
+║     RELAY_ON  = LOW  (coil energised → NO closes → fan runs)  ║
+║     RELAY_OFF = HIGH (coil off      → NO open   → fan stops)  ║
+║                                                                ║
+║  RELAY LOGIC:                                                  ║
+║  • Boot-safe: pin written HIGH before pinMode (fan off)        ║
+║  • Relay ON only after 3 consecutive EMERGENCY LiFi codes      ║
+║  • Relay OFF immediately on ALLCLEAR, HEARTBEAT, link lost     ║
+║  • Safety watchdog: force OFF if stuck in NORMAL state         ║
+║  • LiFi link timeout: 15s silence → NORMAL + relay OFF        ║
+║                                                                ║
+║  WIRING:                                                       ║
+║  • D2  → LDR DO (Li-Fi input)                                 ║
+║  • D6  → Buzzer                                                ║
+║  • D7  → Relay IN                                              ║
+║  • D10 → DFPlayer RX                                           ║
+║  • D11 → DFPlayer TX                                           ║
+║  • 5V  → Relay VCC, LDR VCC, DFPlayer VCC                     ║
+║  • GND → Relay GND, LDR GND, DFPlayer GND, Fan GND            ║
+║  • Relay COM → 5V (fan power source)                           ║
+║  • Relay NO  → Fan RED wire (positive)                         ║
+║  • Fan BLACK → GND                                             ║
+║                                                                ║
+║  Author: Aneesh | Version: 4.0.1 | Date: April 2026           ║
+╚════════════════════════════════════════════════════════════════╝
+*/
+
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+#include <avr/wdt.h>
+
+// ════════════════════════════════════════════════════════════════
+// PIN DEFINITIONS
+// ════════════════════════════════════════════════════════════════
+#define LDR_DO_PIN     2
+#define BUZZER_PIN     6
+#define RELAY_PIN      7
+#define DFPLAYER_RX   10
+#define DFPLAYER_TX   11
+
+// ════════════════════════════════════════════════════════════════
+// RELAY POLARITY — VERIFIED ACTIVE-LOW
+// ════════════════════════════════════════════════════════════════
+#define RELAY_ON    LOW
+#define RELAY_OFF   HIGH
+
+// ════════════════════════════════════════════════════════════════
+// LI-FI PROTOCOL TIMING (5-BIT WITH PARITY)
+// Must match transmitter exactly
+// Frame format: [D3 D2 D1 D0 P] where P = even parity bit
+// ════════════════════════════════════════════════════════════════
+#define LIFI_START_MS        200UL
+#define LIFI_BIT_MS          100UL
+#define LIFI_SAMPLE_OFFSET    50UL
+#define LIFI_MIN_START_MS    150UL
+#define LIFI_MAX_START_MS    350UL
+#define LIFI_MSG_TIMEOUT_MS  900UL
+#define LIFI_SAMPLE_WINDOW    30UL
+#define LIFI_NUM_BITS          5    // 4 data + 1 parity
+
+// ════════════════════════════════════════════════════════════════
+// LI-FI CODES (4-BIT DATA, MUST MATCH TRANSMITTER)
+// ════════════════════════════════════════════════════════════════
+#define CODE_HEARTBEAT   8    // 0b1000 — transmitter normal
+#define CODE_WARNING    10    // 0b1010 — caution level
+#define CODE_EMERGENCY  13    // 0b1101 — CORRECTED FROM 0b1111 (15)
+#define CODE_ALLCLEAR    9    // 0b1001 — manual reset at TX
+
+// ════════════════════════════════════════════════════════════════
+// MP3 TRACK NUMBERS (SD card: 001.mp3 to 004.mp3)
+// ════════════════════════════════════════════════════════════════
+#define MP3_STARTUP    1
+#define MP3_WARNING    2
+#define MP3_EMERGENCY  3
+#define MP3_ALLCLEAR   4
+
+// ════════════════════════════════════════════════════════════════
+// RELAY DEBOUNCE
+// ════════════════════════════════════════════════════════════════
+#define RELAY_CONFIRM_CYCLES  3
+
+// ════════════════════════════════════════════════════════════════
+// AUDIO REPEAT INTERVALS
+// ════════════════════════════════════════════════════════════════
+#define EMERGENCY_REPEAT_MS  30000UL
+#define CAUTION_REPEAT_MS    60000UL
+
+// ════════════════════════════════════════════════════════════════
+// LIFI LINK WATCHDOG
+// ════════════════════════════════════════════════════════════════
+#define LIFI_LINK_TIMEOUT_MS  15000UL
+
+// ════════════════════════════════════════════════════════════════
+// SAFETY WATCHDOG INTERVAL
+// ════════════════════════════════════════════════════════════════
+#define SAFETY_CHECK_MS  10000UL
+
+// ════════════════════════════════════════════════════════════════
+// ENUMS
+// ════════════════════════════════════════════════════════════════
+enum RxState : uint8_t {
+    RX_WAIT_START,
+    RX_DETECT_START,
+    RX_READ_BITS,
+    RX_PROCESS
+};
+
+enum ThreatLevel : uint8_t {
+    THREAT_NORMAL    = 0,
+    THREAT_CAUTION   = 1,
+    THREAT_EMERGENCY = 2
+};
+
+// ════════════════════════════════════════════════════════════════
+// GLOBALS
+// ════════════════════════════════════════════════════════════════
+
+// DFPlayer
+SoftwareSerial      dfSerial(DFPLAYER_RX, DFPLAYER_TX);
+DFRobotDFPlayerMini dfPlayer;
+bool                dfReady     = false;
+unsigned long       lastAudioMs = 0;
+
+// Li-Fi decoder (5-bit frame)
+RxState       rxState      = RX_WAIT_START;
+unsigned long risingEdgeMs = 0;
+uint8_t       receivedBits = 0;      // 5-bit frame (4 data + 1 parity)
+bool          sampled[LIFI_NUM_BITS] = {false, false, false, false, false};
+bool          prevLaserOn  = false;
+
+// Threat state
+ThreatLevel   curThreat  = THREAT_NORMAL;
+ThreatLevel   prevThreat = THREAT_NORMAL;
+
+// Buzzer
+bool          buzzerOn     = false;
+unsigned long lastBuzzerMs = 0;
+
+// Relay
+bool          relayActive       = false;
+int           relayConfirmCount = 0;
+
+// Link watchdog
+unsigned long lastMsgMs = 0;
+bool          linkLost  = false;
+
+// Safety watchdog
+unsigned long lastSafetyCheckMs = 0;
+
+// Diagnostics
+unsigned long bootTime    = 0;
+uint16_t      msgCount    = 0;
+uint16_t      errorCount  = 0;
+uint16_t      parityFails = 0;
+uint8_t       lastCode    = 0;
+
+// ════════════════════════════════════════════════════════════════
+// DISABLE AVR WATCHDOG
+// ════════════════════════════════════════════════════════════════
+void disableWatchdog() {
+    wdt_reset();
+    MCUSR = 0;
+    WDTCSR |= (1 << WDCE) | (1 << WDE);
+    WDTCSR = 0;
+}
+
+// ════════════════════════════════════════════════════════════════
+// PARITY VALIDATION (5-BIT EVEN PARITY)
+// ════════════════════════════════════════════════════════════════
+// Frame format: [D3 D2 D1 D0 P]
+// Returns true if even parity is valid (XOR of all 5 bits == 0)
+bool parityOk(uint8_t frame5bit) {
+    uint8_t parity = 0;
+    for (int i = 0; i < LIFI_NUM_BITS; i++) {
+        parity ^= (frame5bit >> i) & 1;
+    }
+    return (parity == 0);
+}
+
+// Extract 4-bit data code from 5-bit frame
+uint8_t extractCode(uint8_t frame5bit) {
+    return (frame5bit >> 1) & 0x0F;
+}
+
+// ════════════════════════════════════════════════════════════════
+// RELAY CONTROL
+// ════════════════════════════════════════════════════════════════
+
+// Instant OFF — bypasses debounce counter.
+void forceRelayOff() {
+    digitalWrite(RELAY_PIN, RELAY_OFF);     // HIGH → coil off → NO open
+    relayActive       = false;
+    relayConfirmCount = 0;
+
+    Serial.println(F(""));
+    Serial.println(F("╔════════════════════════════════════════╗"));
+    Serial.println(F("║  ✅ RELAY FORCED OFF                  ║"));
+    Serial.println(F("║  Pin → HIGH | Coil OFF | Fan STOPPED  ║"));
+    Serial.println(F("╚════════════════════════════════════════╝"));
+}
+
+// Check if relay should activate (called from processCode only)
+void checkRelayActivation() {
+    if (curThreat == THREAT_EMERGENCY) {
+        if (relayConfirmCount >= RELAY_CONFIRM_CYCLES && !relayActive) {
+            digitalWrite(RELAY_PIN, RELAY_ON);
+            relayActive = true;
+
+            Serial.println(F(""));
+            Serial.println(F("╔════════════════════════════════════════╗"));
+            Serial.println(F("║  🔴 RELAY ACTIVATED                   ║"));
+            Serial.println(F("║  Pin → LOW | Coil ON | Fan RUNNING    ║"));
+            Serial.print(F("║  Confirmed: "));
+            Serial.print(relayConfirmCount);
+            Serial.print(F("/"));
+            Serial.print(RELAY_CONFIRM_CYCLES);
+            Serial.println(F(" codes              ║"));
+            Serial.println(F("╚════════════════════════════════════════╝"));
+        }
+    } else {
+        // Non-emergency → deactivate
+        if (relayActive) {
+            digitalWrite(RELAY_PIN, RELAY_OFF);
+            relayActive = false;
+
+            Serial.println(F(""));
+            Serial.println(F("╔════════════════════════════════════════╗"));
+            Serial.println(F("║  ✅ RELAY DEACTIVATED                 ║"));
+            Serial.println(F("║  Pin → HIGH | Coil OFF | Fan STOPPED  ║"));
+            Serial.println(F("╚════════════════════════════════════════╝"));
+        }
+        relayConfirmCount = 0;
+    }
+}
+
+// Safety watchdog: every 10s check for stuck relay
+void safetyWatchdog() {
+    unsigned long now = millis();
+    if (now - lastSafetyCheckMs < SAFETY_CHECK_MS) return;
+    lastSafetyCheckMs = now;
+
+    if (curThreat == THREAT_NORMAL && relayActive) {
+        Serial.println(F(""));
+        Serial.println(F("⚠️  SAFETY WATCHDOG TRIGGERED"));
+        Serial.println(F("    Relay ON in NORMAL state — forcing OFF"));
+        forceRelayOff();
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// DFPLAYER INITIALIZATION
+// ════════════════════════════════════════════════════════════════
+bool initDFPlayer() {
+    Serial.println(F("\n[DFPLAYER] Initializing..."));
+
+    dfSerial.begin(9600);
+    delay(3000);
+
+    // Hardware reset
+    uint8_t resetCmd[] = {0x7E, 0xFF, 0x06, 0x0C, 0x00,
+                          0x00, 0x00, 0xFE, 0xEE, 0xEF};
+    for (uint8_t i = 0; i < sizeof(resetCmd); i++)
+        dfSerial.write(resetCmd[i]);
+    delay(2000);
+
+    for (uint8_t attempt = 1; attempt <= 3; attempt++) {
+        Serial.print(F("[DFPLAYER] Attempt "));
+        Serial.print(attempt);
+        Serial.print(F("/3... "));
+
+        if (dfPlayer.begin(dfSerial, true, true)) {
+            delay(500);
+            dfPlayer.volume(25);
+            delay(100);
+            dfPlayer.EQ(DFPLAYER_EQ_NORMAL);
+            delay(100);
+            dfPlayer.outputDevice(DFPLAYER_DEVICE_SD);
+            delay(500);
+            Serial.println(F("SUCCESS"));
+            Serial.println(F("[DFPLAYER] Vol=25 EQ=Normal SD=Active\n"));
+            return true;
+        }
+
+        Serial.println(F("FAILED"));
+        if (attempt < 3) delay(2000);
+    }
+
+    Serial.println(F("\n[DFPLAYER] INIT FAILED — running without audio\n"));
+    return false;
+}
+
+// ════════════════════════════════════════════════════════════════
+// AUDIO PLAYBACK
+// ════════════════════════════════════════════════════════════════
+void playAudio(uint8_t fileNum) {
+    if (!dfReady || fileNum < 1 || fileNum > 4) return;
+
+    dfPlayer.play(fileNum);
+    lastAudioMs = millis();
+
+    Serial.print(F("[AUDIO] Playing "));
+    switch (fileNum) {
+        case MP3_STARTUP:   Serial.println(F("001.mp3 — Startup"));   break;
+        case MP3_WARNING:   Serial.println(F("002.mp3 — Warning"));   break;
+        case MP3_EMERGENCY: Serial.println(F("003.mp3 — Emergency")); break;
+        case MP3_ALLCLEAR:  Serial.println(F("004.mp3 — All Clear")); break;
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// REPEAT AUDIO
+// ════════════════════════════════════════════════════════════════
+void handleRepeatAudio() {
+    unsigned long now = millis();
+
+    if (curThreat == THREAT_EMERGENCY
+        && now - lastAudioMs >= EMERGENCY_REPEAT_MS) {
+        playAudio(MP3_EMERGENCY);
+    } else if (curThreat == THREAT_CAUTION
+               && now - lastAudioMs >= CAUTION_REPEAT_MS) {
+        playAudio(MP3_WARNING);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// THREAT LEVEL MANAGEMENT
+// ════════════════════════════════════════════════════════════════
+void setThreat(ThreatLevel newLevel) {
+    if (curThreat == newLevel) return;
+
+    prevThreat = curThreat;
+
+    Serial.println(F(""));
+    Serial.println(F("╔════════════════════════════════════════╗"));
+    Serial.print(F("║  THREAT CHANGE: "));
+
+    switch (prevThreat) {
+        case THREAT_NORMAL:    Serial.print(F("NORMAL"));    break;
+        case THREAT_CAUTION:   Serial.print(F("CAUTION"));   break;
+        case THREAT_EMERGENCY: Serial.print(F("EMERGENCY")); break;
+    }
+    Serial.print(F(" → "));
+    switch (newLevel) {
+        case THREAT_NORMAL:    Serial.println(F("NORMAL    ║")); break;
+        case THREAT_CAUTION:   Serial.println(F("CAUTION   ║")); break;
+        case THREAT_EMERGENCY: Serial.println(F("EMERGENCY ║")); break;
+    }
+    Serial.println(F("╚════════════════════════════════════════╝"));
+
+    curThreat = newLevel;
+}
+
+// ════════════════════════════════════════════════════════════════
+// BUZZER (non-blocking)
+// ════════════════════════════════════════════════════════════════
+void handleBuzzer() {
+    if (curThreat == THREAT_NORMAL) {
+        if (buzzerOn) {
+            digitalWrite(BUZZER_PIN, LOW);
+            buzzerOn = false;
+        }
+        return;
+    }
+
+    unsigned long onMs  = (curThreat == THREAT_EMERGENCY) ? 100UL : 200UL;
+    unsigned long offMs = (curThreat == THREAT_EMERGENCY) ? 100UL : 600UL;
+    unsigned long wait  = buzzerOn ? onMs : offMs;
+
+    if (millis() - lastBuzzerMs >= wait) {
+        lastBuzzerMs = millis();
+        buzzerOn     = !buzzerOn;
+        digitalWrite(BUZZER_PIN, buzzerOn ? HIGH : LOW);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// LIFI LINK WATCHDOG
+// ════════════════════════════════════════════════════════════════
+void handleLinkWatchdog() {
+    if (msgCount == 0) return;
+
+    unsigned long now = millis();
+
+    if (!linkLost && (now - lastMsgMs > LIFI_LINK_TIMEOUT_MS)) {
+        linkLost = true;
+
+        Serial.println(F(""));
+        Serial.println(F("╔════════════════════════════════════════╗"));
+        Serial.println(F("║  ⚠️  LiFi LINK LOST                  ║"));
+        Serial.println(F("║  No code for 15s — going NORMAL       ║"));
+        Serial.println(F("║  Relay forced OFF for safety          ║"));
+        Serial.println(F("╚════════════════════════════════════════╝"));
+
+        forceRelayOff();
+        setThreat(THREAT_NORMAL);
+
+    } else if (linkLost && (now - lastMsgMs <= LIFI_LINK_TIMEOUT_MS)) {
+        linkLost = false;
+
+        Serial.println(F(""));
+        Serial.println(F("╔════════════════════════════════════════╗"));
+        Serial.println(F("║  ✅ LiFi LINK RESTORED                ║"));
+        Serial.println(F("╚════════════════════════════════════════╝"));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// LIFI DECODER — processCode()
+// ════════════════════════════════════════════════════════════════
+void processCode(uint8_t code) {
+    msgCount++;
+    lastMsgMs = millis();
+    linkLost  = false;
+    lastCode  = code;
+
+    Serial.print(F("[RX] Code="));
+    Serial.print(code);
+    Serial.print(F(" (0b"));
+    for (int i = 3; i >= 0; i--) Serial.print((code >> i) & 1);
+    Serial.print(F(") → "));
+
+    switch (code) {
+
+    // ── HEARTBEAT: transmitter alive, all normal ─────────────────
+    case CODE_HEARTBEAT:
+        Serial.println(F("HEARTBEAT — TX normal"));
+        if (curThreat != THREAT_NORMAL) {
+            forceRelayOff();
+            setThreat(THREAT_NORMAL);
+            playAudio(MP3_ALLCLEAR);
+        }
+        break;
+
+    // ── WARNING: elevated readings, no fan yet ───────────────────
+    case CODE_WARNING:
+        Serial.println(F("WARNING — elevated readings"));
+        if (curThreat == THREAT_EMERGENCY) {
+            forceRelayOff();
+        }
+        if (curThreat != THREAT_CAUTION) {
+            setThreat(THREAT_CAUTION);
+            playAudio(MP3_WARNING);
+        }
+        break;
+
+    // ── EMERGENCY: fire/gas confirmed — fan activation ───────────
+    // ═══════════════════════════════════════════════════════════
+    // 🔧 FIX: Increment confirm counter HERE (per LiFi code)
+    //         NOT in loop() which runs every 5ms
+    // ═══════════════════════════════════════════════════════════
+    case CODE_EMERGENCY:
+        Serial.print(F("EMERGENCY — fire/gas detected (Code 1101)"));
+        
+        // Increment relay confirmation counter
+        relayConfirmCount++;
+        if (relayConfirmCount > RELAY_CONFIRM_CYCLES) {
+            relayConfirmCount = RELAY_CONFIRM_CYCLES;
+        }
+        
+        Serial.print(F(" ["));
+        Serial.print(relayConfirmCount);
+        Serial.print(F("/"));
+        Serial.print(RELAY_CONFIRM_CYCLES);
+        Serial.println(F("]"));
+        
+        if (curThreat != THREAT_EMERGENCY) {
+            setThreat(THREAT_EMERGENCY);
+            playAudio(MP3_EMERGENCY);
+        }
+        
+        // Check if relay should activate
+        checkRelayActivation();
+        break;
+
+    // ── ALL CLEAR: manual reset at transmitter ───────────────────
+    case CODE_ALLCLEAR:
+        Serial.println(F("ALL CLEAR — TX reset by personnel"));
+        forceRelayOff();
+        if (curThreat != THREAT_NORMAL) {
+            setThreat(THREAT_NORMAL);
+            playAudio(MP3_ALLCLEAR);
+        }
+        break;
+
+    default:
+        errorCount++;
+        Serial.print(F("UNKNOWN code (error #"));
+        Serial.print(errorCount);
+        Serial.println(F(")"));
+        break;
+    }
+    
+    // For non-emergency codes, update relay state
+    if (code != CODE_EMERGENCY) {
+        checkRelayActivation();
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// LIFI DECODER — receiveLiFi() (5-BIT WITH PARITY)
+// ════════════════════════════════════════════════════════════════
+void receiveLiFi(bool laserOn) {
+    unsigned long now = millis();
+
+    bool risingEdge  = ( laserOn && !prevLaserOn);
+    bool fallingEdge = (!laserOn &&  prevLaserOn);
+    prevLaserOn = laserOn;
+
+    switch (rxState) {
+
+    case RX_WAIT_START:
+        if (risingEdge) {
+            risingEdgeMs = now;
+            receivedBits = 0;
+            for (int i = 0; i < LIFI_NUM_BITS; i++) sampled[i] = false;
+            rxState = RX_DETECT_START;
+        }
+        break;
+
+    case RX_DETECT_START: {
+        unsigned long elapsed = now - risingEdgeMs;
+
+        if (fallingEdge) {
+            if (elapsed >= LIFI_MIN_START_MS && elapsed <= LIFI_MAX_START_MS) {
+                rxState = RX_READ_BITS;
+            } else {
+                errorCount++;
+                rxState = RX_WAIT_START;
+            }
+        } else if (laserOn) {
+            if (elapsed >= LIFI_START_MS && elapsed <= LIFI_MAX_START_MS) {
+                rxState = RX_READ_BITS;
+            } else if (elapsed > LIFI_MAX_START_MS) {
+                errorCount++;
+                rxState = RX_WAIT_START;
+            }
+        }
+        break;
+    }
+
+    case RX_READ_BITS: {
+        unsigned long elapsed = now - risingEdgeMs;
+
+        if (elapsed > LIFI_MSG_TIMEOUT_MS) {
+            errorCount++;
+            rxState = RX_WAIT_START;
+            break;
+        }
+
+        // Sample 5 bits (4 data + 1 parity)
+        for (int bit = LIFI_NUM_BITS - 1; bit >= 0; bit--) {
+            if (!sampled[bit]) {
+                unsigned long sampleTime = risingEdgeMs
+                    + LIFI_START_MS
+                    + (unsigned long)(LIFI_NUM_BITS - 1 - bit) * LIFI_BIT_MS
+                    + LIFI_SAMPLE_OFFSET;
+
+                if (now >= sampleTime
+                    && now < sampleTime + LIFI_SAMPLE_WINDOW) {
+                    sampled[bit] = true;
+                    if (laserOn) receivedBits |= (1 << bit);
+
+                    // Check if all bits sampled
+                    bool allDone = true;
+                    for (int i = 0; i < LIFI_NUM_BITS; i++) {
+                        if (!sampled[i]) {
+                            allDone = false;
+                            break;
+                        }
+                    }
+                    if (allDone) {
+                        rxState = RX_PROCESS;
+                        return;
+                    }
+                }
+            }
+        }
+        break;
+    }
+
+    case RX_PROCESS:
+        // ═══════════════════════════════════════════════════════
+        // PARITY VALIDATION — reject corrupted frames
+        // ═══════════════════════════════════════════════════════
+        if (parityOk(receivedBits)) {
+            processCode(extractCode(receivedBits));
+        } else {
+            parityFails++;
+            errorCount++;
+            Serial.print(F("[RX] PARITY FAIL — frame=0b"));
+            for (int i = LIFI_NUM_BITS - 1; i >= 0; i--) {
+                Serial.print((receivedBits >> i) & 1);
+            }
+            Serial.print(F(" (#"));
+            Serial.print(parityFails);
+            Serial.println(F(")"));
+        }
+        rxState = RX_WAIT_START;
+        break;
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// STATUS DISPLAY
+// ════════════════════════════════════════════════════════════════
+void printStatus() {
+    Serial.println(F(""));
+    Serial.println(F("╔═══════════════════════════════════════╗"));
+    Serial.println(F("║       RECEIVER STATUS REPORT          ║"));
+    Serial.println(F("╠═══════════════════════════════════════╣"));
+
+    Serial.print(F("║ Version:       v4.0.1 (Code 1101)    "));
+    Serial.println(F("║"));
+
+    Serial.print(F("║ Uptime:        "));
+    unsigned long mins = (millis() - bootTime) / 60000UL;
+    Serial.print(mins);
+    Serial.println(F(" min                 ║"));
+
+    Serial.print(F("║ Threat level:  "));
+    switch (curThreat) {
+        case THREAT_EMERGENCY: Serial.println(F("🚨 EMERGENCY           ║")); break;
+        case THREAT_CAUTION:   Serial.println(F("⚠️  CAUTION             ║")); break;
+        default:               Serial.println(F("✅ NORMAL              ║")); break;
+    }
+
+    Serial.print(F("║ Relay:         "));
+    if (relayActive) {
+        Serial.println(F("🔴 ON (fan running)    ║"));
+    } else {
+        Serial.println(F("⚪ OFF (fan stopped)   ║"));
+    }
+
+    Serial.print(F("║ Relay confirm: "));
+    Serial.print(relayConfirmCount);
+    Serial.print(F("/"));
+    Serial.print(RELAY_CONFIRM_CYCLES);
+    Serial.println(F("                   ║"));
+
+    Serial.print(F("║ LiFi msgs:     "));
+    Serial.print(msgCount);
+    Serial.println(F("                      ║"));
+
+    Serial.print(F("║ Last code:     "));
+    switch (lastCode) {
+        case CODE_HEARTBEAT: Serial.println(F("0b1000 HEARTBEAT   ║")); break;
+        case CODE_WARNING:   Serial.println(F("0b1010 WARNING     ║")); break;
+        case CODE_EMERGENCY: Serial.println(F("0b1101 EMERGENCY   ║")); break;
+        case CODE_ALLCLEAR:  Serial.println(F("0b1001 ALLCLEAR    ║")); break;
+        default:
+            Serial.print(F("0b"));
+            for (int i = 3; i >= 0; i--) Serial.print((lastCode >> i) & 1);
+            Serial.println(F(" UNKNOWN       ║"));
+            break;
+    }
+
+    Serial.print(F("║ Errors:        "));
+    Serial.print(errorCount);
+    Serial.print(F(" (parity: "));
+    Serial.print(parityFails);
+    Serial.println(F(")      ║"));
+
+    Serial.print(F("║ Link quality:  "));
+    uint32_t total = (uint32_t)msgCount + errorCount;
+    if (total > 0) {
+        uint32_t quality = 100UL - ((uint32_t)errorCount * 100UL / total);
+        Serial.print(quality);
+        Serial.println(F("%                  ║"));
+    } else {
+        Serial.println(F("N/A                   ║"));
+    }
+
+    Serial.print(F("║ Link:          "));
+    Serial.println(linkLost ? F("❌ LOST                ║") : F("✅ OK                  ║"));
+
+    Serial.print(F("║ DFPlayer:      "));
+    Serial.println(dfReady ? F("✅ Ready               ║") : F("❌ OFFLINE             ║"));
+
+    extern int __heap_start, *__brkval;
+    int v;
+    int freeRam = (int)&v - (__brkval == 0
+                   ? (int)&__heap_start : (int)__brkval);
+    Serial.print(F("║ Free RAM:      "));
+    Serial.print(freeRam);
+    Serial.println(F(" bytes            ║"));
+
+    Serial.println(F("╚═══════════════════════════════════════╝"));
+    Serial.println(F(""));
+}
+
+// ════════════════════════════════════════════════════════════════
+// SETUP
+// ════════════════════════════════════════════════════════════════
+void setup() {
+    disableWatchdog();
+
+    Serial.begin(115200);
+    delay(1000);
+    while (Serial.available()) Serial.read();
+
+    Serial.println(F(""));
+    Serial.println(F("╔════════════════════════════════════════╗"));
+    Serial.println(F("║  ARIA v4.0.1 — RECEIVER UNIT          ║"));
+    Serial.println(F("║  Emergency Code: 0b1101 (CORRECTED)   ║"));
+    Serial.println(F("║  5-bit Li-Fi Parity Validation        ║"));
+    Serial.println(F("║  Relay Debounce: FIXED                ║"));
+    Serial.println(F("╚════════════════════════════════════════╝"));
+    Serial.println(F(""));
+
+    bootTime = millis();
+
+    // ── RELAY — boot-safe ────────────────────────────────────────
+    digitalWrite(RELAY_PIN, RELAY_OFF);
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, RELAY_OFF);
+    relayActive       = false;
+    relayConfirmCount = 0;
+
+    Serial.println(F("[INIT] Relay D7 → HIGH (OFF) — fan STOPPED"));
+
+    // ── BUZZER ──────────────────────────────────────────────────
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
+    Serial.println(F("[INIT] Buzzer D6 → LOW (silent)"));
+
+    // ── LDR ─────────────────────────────────────────────────────
+    pinMode(LDR_DO_PIN, INPUT);
+    Serial.println(F("[INIT] LDR D2 → INPUT"));
+
+    Serial.println(F("[INIT] GPIO done\n"));
+
+    // ── DFPLAYER ────────────────────────────────────────────────
+    dfReady = initDFPlayer();
+    if (dfReady) {
+        playAudio(MP3_STARTUP);
+        delay(5000);
+    }
+
+    // ── INITIAL STATE ───────────────────────────────────────────
+    curThreat         = THREAT_NORMAL;
+    prevThreat        = THREAT_NORMAL;
+    relayActive       = false;
+    relayConfirmCount = 0;
+    linkLost          = false;
+    lastMsgMs         = millis();
+    lastSafetyCheckMs = millis();
+    lastCode          = 0;
+
+    // ── READY ───────────────────────────────────────────────────
+    Serial.println(F("╔════════════════════════════════════════╗"));
+    Serial.println(F("║  SYSTEM READY                         ║"));
+    Serial.println(F("╠════════════════════════════════════════╣"));
+    Serial.println(F("║  LiFi Codes (5-bit with parity):      ║"));
+    Serial.println(F("║   0b1000 → Heartbeat  (normal)        ║"));
+    Serial.println(F("║   0b1010 → Warning    (caution)       ║"));
+    Serial.println(F("║   0b1101 → Emergency  (CORRECTED)     ║"));
+    Serial.println(F("║   0b1001 → All Clear  (reset)         ║"));
+    Serial.println(F("╠════════════════════════════════════════╣"));
+    Serial.println(F("║  Relay Logic:                         ║"));
+    Serial.println(F("║   • ON after 3× EMERGENCY codes       ║"));
+    Serial.println(F("║   • OFF instantly on ALLCLEAR/HB      ║"));
+    Serial.println(F("║   • OFF after 15s LiFi silence        ║"));
+    Serial.println(F("║   • Safety check every 10s            ║"));
+    Serial.println(F("╠════════════════════════════════════════╣"));
+    Serial.println(F("║  Relay Debounce: FIXED                ║"));
+    Serial.println(F("║   Counter increments per LiFi code,   ║"));
+    Serial.println(F("║   NOT per loop iteration.             ║"));
+    Serial.println(F("╚════════════════════════════════════════╝"));
+    Serial.println(F(""));
+
+    printStatus();
+
+    Serial.println(F("Waiting for LiFi messages...\n"));
+}
+
+// ════════════════════════════════════════════════════════════════
+// MAIN LOOP
+// ════════════════════════════════════════════════════════════════
+void loop() {
+    static unsigned long lastStatusMs = 0;
+
+    // 1. Read LDR (Li-Fi light input)
+    bool laserOn = (digitalRead(LDR_DO_PIN) == LOW);
+
+    // 2. Decode incoming LiFi frame (5-bit with parity validation)
+    //    → calls processCode() on complete valid frame
+    //    → processCode() increments relayConfirmCount for EMERGENCY
+    //    → processCode() calls checkRelayActivation()
+    receiveLiFi(laserOn);
+
+    // 3. LiFi link watchdog (15s timeout → NORMAL + relay OFF)
+    handleLinkWatchdog();
+
+    // 4. Safety watchdog (10s: NORMAL but relay ON → force OFF)
+    safetyWatchdog();
+
+    // 5. Non-blocking buzzer
+    handleBuzzer();
+
+    // 6. Repeat audio announcements
+    handleRepeatAudio();
+
+    // 7. Status print every 5 minutes
+    if (millis() - lastStatusMs >= 300000UL) {
+        lastStatusMs = millis();
+        printStatus();
+    }
+
+    // 8. Small delay
+    delay(5);
+}

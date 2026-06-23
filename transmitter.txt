@@ -1,0 +1,1249 @@
+/*
+ * ╔══════════════════════════════════════════════════════════════════════╗
+ * ║  ARIA v4.0 — Autonomous Risk Identification & Alert System          ║
+ * ║  TRANSMITTER UNIT (ESP32)                                            ║
+ * ║                                                                      ║
+ * ║  Architecture:                                                       ║
+ * ║   • Dual-Core FreeRTOS (Core 0: WiFi/Telegram, Core 1: Sensors)    ║
+ * ║   • 5-bit Li-Fi with Even Parity Error Detection                    ║
+ * ║   • Temperature-Compensated Gas Sensor Readings                     ║
+ * ║   • Deterministic Threat Logic (Flame/Manual → EMERGENCY)           ║
+ * ║   • Event Timeline (Black Box Recorder, 10 entries)                 ║
+ * ║   • Non-blocking Telegram via Task Queue                            ║
+ * ║   • ADC Noise Filtering (8-sample Moving Average)                   ║
+ * ║   • Adaptive Baseline Drift Correction (EMA, freeze on threat)      ║
+ * ║   • Professional Web Dashboard with Auto-Refresh                    ║
+ * ║                                                                      ║
+ * ║  EMERGENCY CODE CORRECTED: 0b1101 (was 0b1111)                      ║
+ * ║  Matches system flow documentation exactly                          ║
+ * ║                                                                      ║
+ * ║  Relay Control: MOVED TO RECEIVER UNIT (Arduino Uno)                ║
+ * ║                                                                      ║
+ * ║  Author : Aneesh | Version: 4.0.1 | Date: April 2026                ║
+ * ║  License: MIT | Hardware: ESP32 DevKit v1                           ║
+ * ╚══════════════════════════════════════════════════════════════════════╝
+ */
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <UrlEncode.h>
+#include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+
+/* ═══════════════════════════════════════════════════════════════════
+   PIN DEFINITIONS
+   ═══════════════════════════════════════════════════════════════════ */
+constexpr int DHT_PIN              = 4;
+constexpr int FLAME_PIN            = 18;
+constexpr int MQ135_DO_PIN         = 13;  // Digital threshold output
+constexpr int MQ135_AO_PIN         = 32;  // Analog output (0-4095 ADC)
+constexpr int MQ2_DO_PIN           = 14;
+constexpr int MQ2_AO_PIN           = 33;
+constexpr int LED_GREEN            = 2;   // Normal state
+constexpr int LED_YELLOW           = 15;  // Caution state
+constexpr int LED_RED              = 26;  // Emergency state (blinks)
+constexpr int BUZZER_PIN           = 25;  // Active buzzer
+constexpr int LASER_PIN            = 12;  // Li-Fi transmitter (650nm red)
+constexpr int EMERGENCY_BUTTON_PIN = 16;  // Manual override (active-LOW)
+constexpr int RESET_BUTTON_PIN     = 17;  // System reset (3s hold)
+
+/* ═══════════════════════════════════════════════════════════════════
+   WI-FI & TELEGRAM CONFIGURATION
+   ═══════════════════════════════════════════════════════════════════ */
+constexpr const char* WIFI_KEYWORD1 = "Chakshu";
+constexpr const char* WIFI_KEYWORD2 = "iPhone";
+constexpr const char* WIFI_PASSWORD = "chakshu1727";
+constexpr const char* TG_BOT_TOKEN  = "8785928867:AAHpioh8aphW6MeO2psGQZd47BN7wqaxIks";
+constexpr const char* TG_CHAT_ID    = "-1003943687006";
+constexpr const char* ALERT_LOCATION = "Home - Living Room";
+
+/* ═══════════════════════════════════════════════════════════════════
+   TIMING CONSTANTS (All in milliseconds)
+   ═══════════════════════════════════════════════════════════════════ */
+constexpr unsigned long CALIBRATION_TOTAL_MS  = 180000UL;  // 3 min total
+constexpr unsigned long MQ_WARMUP_MS          =  60000UL;  // 1 min warmup
+constexpr unsigned long LOOP_INTERVAL_MS      =   2000UL;  // Sensor read cycle
+constexpr unsigned long CAUTION_TIMEOUT_MS    =  60000UL;  // Auto-escalate if sustained
+constexpr unsigned long POST_CALIBRATION_GRACE_MS = 45000UL; // Prevent false alarms
+constexpr unsigned long TELEGRAM_COOLDOWN_MS  =  60000UL;  // Rate limit
+constexpr unsigned long TELEGRAM_TIMEOUT_MS   =  30000UL;  // HTTP timeout
+constexpr unsigned long HEARTBEAT_INTERVAL_MS = 300000UL;  // 5 min
+constexpr unsigned long WIFI_RECONNECT_MS     =  15000UL;  // Retry interval
+constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000UL; // Connection timeout
+
+/* ═══════════════════════════════════════════════════════════════════
+   SENSOR THRESHOLDS
+   (Based on empirical testing + MQ135/MQ2 datasheet curves)
+   ═══════════════════════════════════════════════════════════════════ */
+constexpr float TEMP_THRESHOLD_C   = 40.0f;   // Above this = CAUTION
+constexpr float DEV_ELEVATED       = 50.0f;   // Gas ADC deviation for CAUTION
+constexpr float DEV_CRITICAL       = 120.0f;  // Immediate escalation
+constexpr float RATE_DANGEROUS     = 4.0f;    // ADC units/sec (rapid rise)
+constexpr int   FLAME_DEBOUNCE     = 3;       // Consecutive IR detections
+
+/* ═══════════════════════════════════════════════════════════════════
+   LI-FI PROTOCOL (5-BIT WITH PARITY)
+   Format: [D3 D2 D1 D0 P] where P = even parity bit
+   
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  CODE DEFINITIONS (CORRECTED TO MATCH DOCUMENTATION)          ║
+   ╠═══════════════════════════════════════════════════════════════╣
+   ║  CODE_HEARTBEAT  = 0b1000 (8)  → Normal operation             ║
+   ║  CODE_WARNING    = 0b1010 (10) → Caution (gas/temp)           ║
+   ║  CODE_EMERGENCY  = 0b1101 (13) → Emergency (FLAME/MANUAL)     ║
+   ║  CODE_ALLCLEAR   = 0b1001 (9)  → Reset confirmed              ║
+   ╚═══════════════════════════════════════════════════════════════╝
+   
+   ═══════════════════════════════════════════════════════════════════ */
+constexpr unsigned long LIFI_CYCLE_MS   = 1500UL; // Time between transmissions
+constexpr unsigned long LIFI_START_MS   =  200UL; // Start pulse duration
+constexpr unsigned long LIFI_BIT_MS     =  100UL; // Per-bit duration
+constexpr uint8_t       LIFI_NUM_BITS   = 5;      // 4 data + 1 parity
+
+// 4-bit data codes (pre-encoding)
+constexpr uint8_t CODE_HEARTBEAT  = 0b1000;  // 8  - Normal operation
+constexpr uint8_t CODE_WARNING    = 0b1010;  // 10 - Caution (gas/temp elevated)
+constexpr uint8_t CODE_EMERGENCY  = 0b1101;  // 13 - Emergency (CORRECTED FROM 0b1111)
+constexpr uint8_t CODE_ALLCLEAR   = 0b1001;  // 9  - All Clear
+
+constexpr int ALL_CLEAR_BURST_COUNT = 5;    // Repeat all-clear code
+
+/* ═══════════════════════════════════════════════════════════════════
+   ENUMERATIONS
+   ═══════════════════════════════════════════════════════════════════ */
+enum ThreatLevel : uint8_t { 
+    THREAT_NORMAL    = 0, 
+    THREAT_CAUTION   = 1, 
+    THREAT_EMERGENCY = 2 
+};
+
+enum LiFiPhase : uint8_t { 
+    LIFI_IDLE, 
+    LIFI_START_PULSE, 
+    LIFI_TRANSMITTING 
+};
+
+/* ═══════════════════════════════════════════════════════════════════
+   DATA STRUCTURES
+   ═══════════════════════════════════════════════════════════════════ */
+
+// Analog gas sensor state
+struct GasSensor {
+    float reading      = 0.0f;
+    float prevReading  = 0.0f;
+    float baseline     = 500.0f;  // Set during calibration
+    float deviation    = 0.0f;    // |reading - baseline|
+    float ratePerSec   = 0.0f;    // Change rate (for rapid-rise detection)
+    bool  doTriggered  = false;   // Digital output state
+    bool  calibrated   = false;
+};
+
+// Flame sensor state (debounced)
+struct FlameState {
+    bool detected      = false;
+    bool pendingState  = false;
+    int  debounceCount = 0;
+};
+
+// Event log entry (circular buffer)
+struct EventLogEntry {
+    unsigned long timestamp;
+    String        eventType;
+};
+
+// Event timeline (black box recorder)
+struct EventLog {
+    EventLogEntry buffer[10];
+    uint8_t       index = 0;
+    uint8_t       count = 0;
+};
+
+// Main system state
+struct SystemState {
+    // DHT22 environmental sensors
+    float tempC         = 25.0f;
+    float tempBaseline  = 25.0f;
+    float humidity      = 50.0f;
+    float humBaseline   = 50.0f;
+    bool  dhtValid      = false;
+    
+    // Gas sensors
+    GasSensor mq135;  // Air quality (CO2, NH3, benzene)
+    GasSensor mq2;    // Smoke, LPG, methane
+    
+    // Flame sensor
+    FlameState flame;
+    
+    // Threat analysis
+    ThreatLevel currentThreat  = THREAT_NORMAL;
+    ThreatLevel previousThreat = THREAT_NORMAL;
+    int         confScore      = 1;  // 1-4 scale
+    
+    // State tracking
+    bool          cautionActive   = false;
+    bool          manualEmergency = false;
+    unsigned long calibDoneMs     = 0;
+    unsigned long lastLoopMs      = 0;
+    unsigned long cautionStartMs  = 0;
+    
+    // Reset button state machine
+    bool          resetActive     = false;
+    unsigned long resetHoldStart  = 0;
+    
+    // Event logging
+    EventLog log;
+};
+
+// Li-Fi transmitter state machine
+struct LiFiState {
+    LiFiPhase     phase       = LIFI_IDLE;
+    uint8_t       code5bit    = 0;        // Encoded 5-bit frame
+    int8_t        bitIndex    = 4;        // Current bit (4→0)
+    uint8_t       allClearBurst = 0;      // Remaining all-clear transmissions
+    unsigned long cycleStartMs  = 0;
+    unsigned long phaseStartMs  = 0;
+};
+
+/* ═══════════════════════════════════════════════════════════════════
+   GLOBAL INSTANCES
+   ═══════════════════════════════════════════════════════════════════ */
+SystemState       sys;
+LiFiState         lifi;
+DHT               dht(DHT_PIN, DHT22);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+WebServer         server(80);
+QueueHandle_t     telegramQueue;
+Preferences       prefs;
+
+// Status flags
+bool wifiAvailable      = false;
+String connectedSSID    = "";
+
+// Telegram tracking
+unsigned long lastTelegramSent = 0;
+unsigned long lastHeartbeat    = 0;
+
+// Output timers (non-blocking)
+unsigned long blinkLastMs  = 0;
+unsigned long buzzerLastMs = 0;
+bool blinkState  = false;
+bool buzzerState = false;
+
+// LCD optimization (only redraw on change)
+bool lcdDirty = true;
+
+/* ═══════════════════════════════════════════════════════════════════
+   HELPER FUNCTIONS
+   ═══════════════════════════════════════════════════════════════════ */
+
+// Validate sensor readings
+inline bool validTemp(float t) { return t >= -40.0f && t <= 85.0f && !isnan(t); }
+inline bool validHum(float h)  { return h >= 0.0f && h <= 100.0f && !isnan(h); }
+inline bool validADC(int v)    { return v >= 0 && v <= 4095; }
+
+// 8-sample moving average for ADC noise reduction
+// ESP32 ADC is notoriously noisy (±50 LSB typical)
+int readMQFiltered(int pin) {
+    static int buffers[2][8] = {{0},{0}};  // Two channels (MQ135, MQ2)
+    static uint8_t indices[2] = {0, 0};
+    
+    int channel = (pin == MQ135_AO_PIN) ? 0 : 1;
+    
+    buffers[channel][indices[channel]] = analogRead(pin);
+    indices[channel] = (indices[channel] + 1) & 7;  // Wrap 0-7
+    
+    long sum = 0;
+    for (int i = 0; i < 8; i++) sum += buffers[channel][i];
+    return sum >> 3;  // Divide by 8
+}
+
+// Temperature/Humidity compensation for MQ sensors
+// MQ sensor resistance varies with ambient conditions
+// Datasheet correction factor: R = R0 * (1 + α*ΔT + β*ΔH)
+float compensateMQ(float rawADC, float tempC, float humPercent) {
+    const float ALPHA = 0.02f;  // Temp coefficient (2%/°C)
+    const float BETA  = 0.01f;  // Humidity coefficient (1%/%)
+    const float T_REF = 20.0f;  // Reference temp
+    const float H_REF = 65.0f;  // Reference humidity
+    
+    float correctionFactor = 1.0f + ALPHA * (tempC - T_REF) 
+                                  + BETA * (humPercent - H_REF);
+    
+    return rawADC / correctionFactor;
+}
+
+// 5-bit even parity encoding
+// Output format: [D3 D2 D1 D0 P]
+// P = XOR of D3, D2, D1, D0 (even parity)
+uint8_t encodeLiFi(uint8_t code4bit) {
+    uint8_t parity = 0;
+    for (int i = 0; i < 4; i++) {
+        parity ^= (code4bit >> i) & 1;
+    }
+    return (code4bit << 1) | parity;
+}
+
+// Event logging (circular buffer)
+void logEvent(const String& eventType) {
+    sys.log.buffer[sys.log.index].timestamp = millis();
+    sys.log.buffer[sys.log.index].eventType = eventType;
+    sys.log.index = (sys.log.index + 1) % 10;
+    if (sys.log.count < 10) sys.log.count++;
+    
+    Serial.print(F("[EVENT] "));
+    Serial.print(millis() / 1000);
+    Serial.print(F("s — "));
+    Serial.println(eventType);
+}
+
+// Buzzer test (startup confirmation)
+void testBuzzer() {
+    for (int i = 0; i < 2; i++) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        delay(100);
+        digitalWrite(BUZZER_PIN, LOW);
+        delay(100);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   TELEGRAM BOT (CORE 0 FREERTOS TASK)
+   Non-blocking — runs on separate core to avoid freezing sensors
+   ═══════════════════════════════════════════════════════════════════ */
+void telegramTask(void* parameter) {
+    String message;
+    
+    for (;;) {  // Infinite loop
+        // Wait for message from queue (blocking, but only this task)
+        if (xQueueReceive(telegramQueue, &message, portMAX_DELAY) == pdTRUE) {
+            
+            // Safety checks
+            if (!wifiAvailable || WiFi.status() != WL_CONNECTED) {
+                logEvent("TG_QUEUED_OFFLINE");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            
+            unsigned long now = millis();
+            if (now - lastTelegramSent < TELEGRAM_COOLDOWN_MS) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;  // Rate limit
+            }
+            
+            // Prepare secure HTTPS client
+            WiFiClientSecure client;
+            client.setInsecure();  // Skip certificate validation (Telegram's cert changes)
+            client.setTimeout(15);
+            
+            // Temporarily stop web server (resource conflict prevention)
+            server.stop();
+            
+            // Build Telegram API URL
+            String url = "https://api.telegram.org/bot";
+            url += TG_BOT_TOKEN;
+            url += "/sendMessage?chat_id=";
+            url += TG_CHAT_ID;
+            url += "&text=";
+            url += urlEncode(message);
+            url += "&parse_mode=HTML";
+            
+            HTTPClient http;
+            bool success = false;
+            
+            if (http.begin(client, url)) {
+                http.setTimeout(TELEGRAM_TIMEOUT_MS);
+                http.addHeader("Connection", "close");
+                
+                int httpCode = http.GET();
+                
+                if (httpCode == 200) {
+                    lastTelegramSent = now;
+                    logEvent("TG_SENT_OK");
+                    success = true;
+                } else {
+                    Serial.printf("[TG] HTTP Error %d\n", httpCode);
+                    logEvent("TG_HTTP_ERROR");
+                }
+                
+                http.end();
+            } else {
+                logEvent("TG_CONNECT_FAIL");
+            }
+            
+            // Restart web server
+            server.begin();
+            
+            if (!success) {
+                vTaskDelay(pdMS_TO_TICKS(5000));  // Back off on failure
+            }
+        }
+    }
+}
+
+// Queue message for Telegram (non-blocking)
+void sendTelegram(const String& msg) {
+    xQueueSend(telegramQueue, &msg, 0);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   WI-FI CONNECTION
+   Smart scan for SSID containing keywords
+   ═══════════════════════════════════════════════════════════════════ */
+bool connectToWiFi() {
+    Serial.println(F("\n[WiFi] Scanning..."));
+    
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    
+    int n = WiFi.scanNetworks();
+    if (n == 0) {
+        Serial.println(F("[WiFi] No networks found"));
+        return false;
+    }
+    
+    String targetSSID = "";
+    int bestRSSI = -999;
+    
+    for (int i = 0; i < n; i++) {
+        String ssid = WiFi.SSID(i);
+        int rssi = WiFi.RSSI(i);
+        
+        Serial.printf("  %d. \"%s\" %ddBm\n", i+1, ssid.c_str(), rssi);
+        
+        if ((ssid.indexOf(WIFI_KEYWORD1) >= 0 || ssid.indexOf(WIFI_KEYWORD2) >= 0) 
+            && rssi > bestRSSI) {
+            targetSSID = ssid;
+            bestRSSI = rssi;
+        }
+    }
+    
+    if (targetSSID.isEmpty()) {
+        Serial.println(F("[WiFi] Target SSID not found"));
+        return false;
+    }
+    
+    Serial.printf("[WiFi] Connecting to \"%s\" (%ddBm)...\n", 
+                  targetSSID.c_str(), bestRSSI);
+    
+    connectedSSID = targetSSID;
+    WiFi.begin(targetSSID.c_str(), WIFI_PASSWORD);
+    
+    unsigned long startTime = millis();
+    while (WiFi.status() != WL_CONNECTED 
+           && millis() - startTime < WIFI_CONNECT_TIMEOUT_MS) {
+        delay(300);
+        Serial.print('.');
+    }
+    Serial.println();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print(F("[WiFi] Connected! IP: "));
+        Serial.println(WiFi.localIP());
+        return true;
+    }
+    
+    Serial.println(F("[WiFi] Connection failed"));
+    return false;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   WEB DASHBOARD
+   Real-time monitoring interface with auto-refresh
+   ═══════════════════════════════════════════════════════════════════ */
+void handleWebRoot() {
+    String html = F("<!DOCTYPE html><html lang='en'><head>");
+    html += F("<meta charset='UTF-8'>");
+    html += F("<meta name='viewport' content='width=device-width,initial-scale=1.0'>");
+    html += F("<title>ARIA v4.0 Dashboard</title>");
+    html += F("<style>");
+    html += F("*{margin:0;padding:0;box-sizing:border-box}");
+    html += F("body{font-family:'Segoe UI',sans-serif;background:#0a0e1a;color:#e0e6ed;padding:20px}");
+    html += F("h1{text-align:center;margin-bottom:20px;color:#00ff88;text-shadow:0 0 20px #00ff88}");
+    html += F(".card{background:#151d2f;padding:20px;margin:15px 0;border-radius:10px;border-left:4px solid #00ff88}");
+    html += F(".card h2{color:#00ff88;margin-bottom:15px;font-size:1.2em}");
+    html += F(".metric{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #2a3f5f}");
+    html += F(".metric:last-child{border:none}");
+    html += F(".value{font-weight:bold;color:#00ff88}");
+    html += F(".emg{background:#330a0a;border-color:#ff0044;animation:pulse 1s infinite}");
+    html += F(".emg h2,.emg .value{color:#ff0044}");
+    html += F("@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.7}}");
+    html += F("</style></head><body>");
+    html += F("<h1>🔥 ARIA v4.0 Dashboard</h1>");
+    html += F("<div id='status' class='card'><h2>Status</h2><div id='statusContent'>Loading...</div></div>");
+    html += F("<div id='sensors' class='card'><h2>Sensors</h2><div id='sensorContent'>--</div></div>");
+    html += F("<div id='system' class='card'><h2>System Info</h2><div id='systemContent'>--</div></div>");
+    html += F("<div id='events' class='card'><h2>Event Log</h2><div id='eventContent'>--</div></div>");
+    html += F("<script>");
+    html += F("function update(){fetch('/data').then(r=>r.json()).then(d=>{");
+    html += F("document.getElementById('statusContent').innerHTML='");
+    html += F("<div class=\"metric\"><span>Threat Level</span><span class=\"value\">'+d.threat+'</span></div>");
+    html += F("<div class=\"metric\"><span>Confidence</span><span class=\"value\">'+d.conf+'/4</span></div>");
+    html += F("<div class=\"metric\"><span>Flame</span><span class=\"value\">'+(d.flame?'🔥 YES':'✓ NO')+'</span></div>';");
+    html += F("document.getElementById('sensorContent').innerHTML='");
+    html += F("<div class=\"metric\"><span>Temperature</span><span class=\"value\">'+d.temp+'°C</span></div>");
+    html += F("<div class=\"metric\"><span>Humidity</span><span class=\"value\">'+d.hum+'%</span></div>");
+    html += F("<div class=\"metric\"><span>MQ135</span><span class=\"value\">'+d.mq135+'</span></div>");
+    html += F("<div class=\"metric\"><span>MQ2</span><span class=\"value\">'+d.mq2+'</span></div>';");
+    html += F("document.getElementById('systemContent').innerHTML='");
+    html += F("<div class=\"metric\"><span>WiFi</span><span class=\"value\">'+d.rssi+' dBm</span></div>");
+    html += F("<div class=\"metric\"><span>IP</span><span class=\"value\">'+d.ip+'</span></div>");
+    html += F("<div class=\"metric\"><span>Uptime</span><span class=\"value\">'+d.uptime+' min</span></div>");
+    html += F("<div class=\"metric\"><span>Li-Fi Code</span><span class=\"value\">'+d.lifi+'</span></div>';");
+    html += F("document.getElementById('eventContent').innerHTML='<div class=\"metric\"><span>Last Events</span><span>'+d.log+'</span></div>';");
+    html += F("document.body.className=(d.threat=='EMERGENCY'?'emg':'');");
+    html += F("});}setInterval(update,2000);update();");
+    html += F("</script></body></html>");
+    
+    server.send(200, "text/html", html);
+}
+
+void handleWebData() {
+    String threatStr = sys.manualEmergency ? "EMERGENCY" :
+                       (sys.currentThreat == THREAT_EMERGENCY ? "EMERGENCY" :
+                       (sys.currentThreat == THREAT_CAUTION ? "CAUTION" : "NORMAL"));
+    
+    String lifiStr = "0b";
+    for (int i = 4; i >= 0; i--) {
+        lifiStr += (lifi.code5bit >> i) & 1 ? "1" : "0";
+    }
+    lifiStr += " (";
+    lifiStr += (sys.manualEmergency || sys.currentThreat == THREAT_EMERGENCY) ? "EMRG 1101" :
+               (sys.currentThreat == THREAT_CAUTION) ? "WARN 1010" : "HB 1000";
+    lifiStr += ")";
+    
+    String eventLog = "";
+    for (int i = 0; i < sys.log.count; i++) {
+        int idx = (sys.log.index - 1 - i + 10) % 10;
+        eventLog += sys.log.buffer[idx].eventType;
+        if (i < sys.log.count - 1) eventLog += " | ";
+    }
+    
+    String json = "{";
+    json += "\"threat\":\"" + threatStr + "\",";
+    json += "\"conf\":" + String(sys.confScore) + ",";
+    json += "\"flame\":" + String(sys.flame.detected ? "true" : "false") + ",";
+    json += "\"temp\":" + String(sys.tempC, 1) + ",";
+    json += "\"hum\":" + String((int)sys.humidity) + ",";
+    json += "\"mq135\":" + String((int)sys.mq135.reading) + ",";
+    json += "\"mq2\":" + String((int)sys.mq2.reading) + ",";
+    json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+    json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    json += "\"uptime\":" + String(millis() / 60000UL) + ",";
+    json += "\"lifi\":\"" + lifiStr + "\",";
+    json += "\"log\":\"" + eventLog + "\"";
+    json += "}";
+    
+    server.send(200, "application/json", json);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   LI-FI TRANSMITTER (5-BIT WITH PARITY)
+   State machine for optical data transmission
+   ═══════════════════════════════════════════════════════════════════ */
+void runLiFiTransmitter() {
+    unsigned long now = millis();
+    
+    switch (lifi.phase) {
+        
+    case LIFI_IDLE:
+        // Check if it's time for next transmission
+        if (now - lifi.cycleStartMs >= LIFI_CYCLE_MS) {
+            
+            // Determine 4-bit code based on current threat
+            uint8_t code4bit;
+            if (sys.manualEmergency || sys.currentThreat == THREAT_EMERGENCY) {
+                code4bit = CODE_EMERGENCY;  // 0b1101
+                lifi.allClearBurst = 0;  // Cancel any pending all-clear
+            } else if (sys.currentThreat == THREAT_CAUTION) {
+                code4bit = CODE_WARNING;  // 0b1010
+            } else if (lifi.allClearBurst > 0) {
+                code4bit = CODE_ALLCLEAR;  // 0b1001
+                lifi.allClearBurst--;
+            } else {
+                code4bit = CODE_HEARTBEAT;  // 0b1000
+            }
+            
+            // Encode with parity bit
+            lifi.code5bit = encodeLiFi(code4bit);
+            
+            // Start transmission
+            lifi.cycleStartMs = now;
+            lifi.phaseStartMs = now;
+            lifi.phase = LIFI_START_PULSE;
+            lifi.bitIndex = 4;  // Will transmit bits 4→0
+            
+            digitalWrite(LASER_PIN, HIGH);  // Begin start pulse
+        }
+        break;
+        
+    case LIFI_START_PULSE:
+        // Wait for start pulse duration
+        if (now - lifi.phaseStartMs >= LIFI_START_MS) {
+            lifi.phaseStartMs = now;
+            lifi.phase = LIFI_TRANSMITTING;
+            
+            // Set laser for first data bit
+            bool bitValue = (lifi.code5bit >> lifi.bitIndex) & 1;
+            digitalWrite(LASER_PIN, bitValue ? HIGH : LOW);
+        }
+        break;
+        
+    case LIFI_TRANSMITTING:
+        // Transmit each bit (100ms per bit)
+        if (now - lifi.phaseStartMs >= LIFI_BIT_MS) {
+            lifi.phaseStartMs = now;
+            lifi.bitIndex--;
+            
+            if (lifi.bitIndex >= 0) {
+                // More bits to send
+                bool bitValue = (lifi.code5bit >> lifi.bitIndex) & 1;
+                digitalWrite(LASER_PIN, bitValue ? HIGH : LOW);
+            } else {
+                // All bits sent
+                digitalWrite(LASER_PIN, LOW);
+                lifi.phase = LIFI_IDLE;
+            }
+        }
+        break;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   BUTTON HANDLING
+   Emergency (instant trigger) + Reset (3-second hold with countdown)
+   ═══════════════════════════════════════════════════════════════════ */
+void handleButtons() {
+    static bool lastEmergencyRead = HIGH;
+    
+    // ────── EMERGENCY BUTTON (Active-LOW) ──────
+    bool emgRead = digitalRead(EMERGENCY_BUTTON_PIN);
+    
+    if (emgRead == LOW && lastEmergencyRead == HIGH && !sys.manualEmergency) {
+        delay(20);  // Debounce
+        if (digitalRead(EMERGENCY_BUTTON_PIN) == LOW) {
+            sys.manualEmergency = true;
+            sys.currentThreat   = THREAT_EMERGENCY;
+            sys.confScore       = 4;
+            lcdDirty            = true;
+            
+            Serial.println(F("\n╔════════════════════════════════════════╗"));
+            Serial.println(F("║  🆘 MANUAL EMERGENCY ACTIVATED         ║"));
+            Serial.println(F("║  Li-Fi → 0b11011 (EMERGENCY + parity)  ║"));
+            Serial.println(F("║  Code: 1101 (Corrected)                ║"));
+            Serial.println(F("╚════════════════════════════════════════╝"));
+            
+            String alert = "<b>🆘 MANUAL EMERGENCY</b>\n\n";
+            alert += "<b>Location:</b> " + String(ALERT_LOCATION) + "\n";
+            alert += "Emergency button pressed by user.\n";
+            alert += "<b>Fan relay activating at Receiver unit.</b>\n";
+            alert += "<b>IMMEDIATE ACTION REQUIRED</b>";
+            
+            sendTelegram(alert);
+            logEvent("MANUAL_EMERGENCY");
+        }
+    }
+    lastEmergencyRead = emgRead;
+    
+    // ────── RESET BUTTON (3-Second Hold) ──────
+    bool rstRead = digitalRead(RESET_BUTTON_PIN);
+    
+    if (rstRead == LOW) {
+        if (!sys.resetActive) {
+            // Button just pressed
+            sys.resetActive    = true;
+            sys.resetHoldStart = millis();
+            lcd.clear();
+            lcd.print(F("Hold 3s to reset"));
+            lcd.setCursor(0, 1);
+            lcd.print(F("3...            "));
+            Serial.println(F("[RESET] Hold 3 seconds to confirm..."));
+        }
+        
+        // Show countdown
+        unsigned long held = millis() - sys.resetHoldStart;
+        lcd.setCursor(0, 1);
+        if (held > 2000) lcd.print(F("1..."));
+        else if (held > 1000) lcd.print(F("2..."));
+        
+        // Execute reset after 3 seconds
+        if (held >= 3000) {
+            sys.resetActive     = false;
+            sys.manualEmergency = false;
+            sys.currentThreat   = THREAT_NORMAL;
+            sys.confScore       = 1;
+            sys.cautionActive   = false;
+            lifi.allClearBurst  = ALL_CLEAR_BURST_COUNT;
+            lcdDirty            = true;
+            
+            Serial.println(F("\n╔════════════════════════════════════════╗"));
+            Serial.println(F("║  ✅ SYSTEM RESET (AUTHORIZED)          ║"));
+            Serial.println(F("║  Li-Fi → 0b10010 (ALL CLEAR ×5)        ║"));
+            Serial.println(F("╚════════════════════════════════════════╝"));
+            
+            String alert = "<b>✅ ALL CLEAR — SYSTEM RESET</b>\n\n";
+            alert += "<b>Location:</b> " + String(ALERT_LOCATION) + "\n";
+            alert += "Reset by authorized personnel.\n";
+            alert += "<b>Fan relay stopping at Receiver unit.</b>";
+            
+            sendTelegram(alert);
+            logEvent("SYSTEM_RESET");
+            
+            lcd.clear();
+            lcd.print(F("SYSTEM RESET    "));
+            lcd.setCursor(0, 1);
+            lcd.print(F("AllClear → RX   "));
+            delay(1500);
+        }
+    } else {
+        // Button released
+        if (sys.resetActive) {
+            sys.resetActive = false;
+            lcdDirty = true;
+            Serial.println(F("[RESET] Cancelled (released early)"));
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   CALIBRATION PHASE
+   3-minute baseline establishment (1 min warmup + 2 min sampling)
+   ═══════════════════════════════════════════════════════════════════ */
+void runCalibration() {
+    Serial.println(F("\n╔════════════════════════════════════════╗"));
+    Serial.println(F("║  CALIBRATION — ENSURE CLEAN AIR       ║"));
+    Serial.println(F("╚════════════════════════════════════════╝"));
+    
+    lcd.clear();
+    lcd.print(F("MQ Warmup..."));
+    
+    // Phase 1: Heater warmup (60 seconds)
+    unsigned long warmupStart = millis();
+    while (millis() - warmupStart < MQ_WARMUP_MS) {
+        unsigned long remaining = (MQ_WARMUP_MS - (millis() - warmupStart)) / 1000;
+        lcd.setCursor(0, 1);
+        lcd.print(F("Warmup: "));
+        lcd.print(remaining);
+        lcd.print(F("s  "));
+        
+        // Read DHT to initialize
+        dht.readTemperature();
+        dht.readHumidity();
+        delay(1000);
+    }
+    
+    // Phase 2: Baseline sampling (120 seconds)
+    lcd.clear();
+    lcd.print(F("Sampling..."));
+    
+    float tempSum = 0, humSum = 0, mq135Sum = 0, mq2Sum = 0;
+    int sampleCount = 0;
+    
+    unsigned long samplingDuration = CALIBRATION_TOTAL_MS - MQ_WARMUP_MS;
+    unsigned long samplingStart = millis();
+    
+    while (millis() - samplingStart < samplingDuration) {
+        unsigned long remaining = (samplingDuration - (millis() - samplingStart)) / 1000;
+        lcd.setCursor(0, 1);
+        lcd.print(F("Sample: "));
+        lcd.print(remaining);
+        lcd.print(F("s  "));
+        
+        float t = dht.readTemperature();
+        float h = dht.readHumidity();
+        int mq135Raw = analogRead(MQ135_AO_PIN);
+        int mq2Raw   = analogRead(MQ2_AO_PIN);
+        
+        if (validTemp(t)) tempSum += t;
+        if (validHum(h))  humSum  += h;
+        if (validADC(mq135Raw)) mq135Sum += mq135Raw;
+        if (validADC(mq2Raw))   mq2Sum   += mq2Raw;
+        
+        sampleCount++;
+        delay(1000);
+    }
+    
+    // Calculate baselines
+    if (sampleCount > 0) {
+        sys.tempBaseline     = tempSum / sampleCount;
+        sys.humBaseline      = humSum / sampleCount;
+        sys.mq135.baseline   = mq135Sum / sampleCount;
+        sys.mq2.baseline     = mq2Sum / sampleCount;
+        sys.mq135.calibrated = true;
+        sys.mq2.calibrated   = true;
+    }
+    
+    sys.calibDoneMs = millis();
+    
+    Serial.println(F("✅ CALIBRATION COMPLETE"));
+    Serial.printf("  Temp Baseline:  %.1f°C\n", sys.tempBaseline);
+    Serial.printf("  Hum Baseline:   %.0f%%\n", sys.humBaseline);
+    Serial.printf("  MQ135 Baseline: %.0f ADC\n", sys.mq135.baseline);
+    Serial.printf("  MQ2 Baseline:   %.0f ADC\n", sys.mq2.baseline);
+    
+    lcd.clear();
+    lcd.print(F("Cal Complete!"));
+    delay(1000);
+    lcdDirty = true;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SENSOR READING
+   Filtered ADC + Temperature compensation + Adaptive baseline
+   ═══════════════════════════════════════════════════════════════════ */
+void readSensors() {
+    // ────── DHT22 (Temperature & Humidity) ──────
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    
+    if (validTemp(t) && validHum(h)) {
+        sys.tempC    = t;
+        sys.humidity = h;
+        sys.dhtValid = true;
+        
+        // Adaptive baseline (only drift in NORMAL state)
+        if (sys.currentThreat == THREAT_NORMAL) {
+            const float ALPHA = 0.1f;  // EMA smoothing
+            sys.tempBaseline = (1.0f - ALPHA) * sys.tempBaseline + ALPHA * t;
+            sys.humBaseline  = (1.0f - ALPHA) * sys.humBaseline  + ALPHA * h;
+        }
+    } else {
+        sys.dhtValid = false;
+    }
+    
+    // ────── MQ135 (Air Quality) ──────
+    sys.mq135.prevReading = sys.mq135.reading;
+    int rawMQ135 = readMQFiltered(MQ135_AO_PIN);
+    sys.mq135.reading = compensateMQ(rawMQ135, sys.tempC, sys.humidity);
+    sys.mq135.doTriggered = (digitalRead(MQ135_DO_PIN) == LOW);
+    
+    // ────── MQ2 (Smoke/LPG) ──────
+    sys.mq2.prevReading = sys.mq2.reading;
+    int rawMQ2 = readMQFiltered(MQ2_AO_PIN);
+    sys.mq2.reading = compensateMQ(rawMQ2, sys.tempC, sys.humidity);
+    sys.mq2.doTriggered = (digitalRead(MQ2_DO_PIN) == LOW);
+    
+    // Adaptive baseline for gas sensors (freeze during threat)
+    if (sys.currentThreat == THREAT_NORMAL) {
+        const float ALPHA = 0.1f;
+        sys.mq135.baseline = (1.0f - ALPHA) * sys.mq135.baseline + ALPHA * sys.mq135.reading;
+        sys.mq2.baseline   = (1.0f - ALPHA) * sys.mq2.baseline   + ALPHA * sys.mq2.reading;
+    }
+    
+    // ────── FLAME SENSOR (Debounced IR) ──────
+    bool rawFlame = (digitalRead(FLAME_PIN) == LOW);
+    
+    if (rawFlame == sys.flame.pendingState) {
+        sys.flame.debounceCount++;
+        if (sys.flame.debounceCount >= FLAME_DEBOUNCE) {
+            if (sys.flame.detected != rawFlame) lcdDirty = true;
+            sys.flame.detected = rawFlame;
+            sys.flame.debounceCount = 0;
+        }
+    } else {
+        sys.flame.pendingState  = rawFlame;
+        sys.flame.debounceCount = 0;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   THREAT ANALYSIS
+   Deterministic logic: Flame/Manual → EMERGENCY, Gas/Temp → CAUTION
+   ═══════════════════════════════════════════════════════════════════ */
+void analyzeThreats() {
+    sys.previousThreat = sys.currentThreat;
+    
+    // ────── EMERGENCY CONDITION (HIGHEST PRIORITY) ──────
+    // Triggered ONLY by:
+    //   1. Flame sensor detection (3× debounced)
+    //   2. Manual emergency button press
+    if (sys.manualEmergency || sys.flame.detected) {
+        sys.currentThreat = THREAT_EMERGENCY;
+        sys.confScore = 4;
+        
+        if (sys.previousThreat != THREAT_EMERGENCY) {
+            lcdDirty = true;
+            
+            Serial.println(F("\n╔════════════════════════════════════════╗"));
+            Serial.println(F("║  🚨 EMERGENCY STATE                    ║"));
+            Serial.println(F("║  Flame detected or manual trigger      ║"));
+            Serial.println(F("║  Li-Fi → 0b11011 (EMERGENCY Code 1101) ║"));
+            Serial.println(F("╚════════════════════════════════════════╝"));
+            
+            String alert = "<b>🚨 EMERGENCY ALERT</b>\n\n";
+            alert += "<b>Location:</b> " + String(ALERT_LOCATION) + "\n";
+            alert += "<b>FIRE DETECTED</b>\n\n";
+            alert += "<b>Sensors:</b>\n";
+            if (sys.dhtValid) {
+                alert += "Temp: " + String(sys.tempC, 1) + "°C\n";
+                alert += "Humidity: " + String((int)sys.humidity) + "%\n";
+            }
+            alert += "MQ135: " + String((int)sys.mq135.reading) + "\n";
+            alert += "MQ2: " + String((int)sys.mq2.reading) + "\n";
+            alert += "Flame: " + String(sys.flame.detected ? "DETECTED" : "Manual") + "\n\n";
+            alert += "<b>Fan relay activating at Receiver.</b>\n";
+            alert += "<b>TAKE IMMEDIATE ACTION</b>";
+            
+            sendTelegram(alert);
+            logEvent("EMERGENCY_TRIGGERED");
+        }
+        return;
+    }
+    
+    // ────── CAUTION CONDITION ──────
+    // Triggered by:
+    //   - Gas sensors (digital trigger OR analog deviation)
+    //   - Temperature > 40°C
+    bool gasElevated = sys.mq135.doTriggered || sys.mq2.doTriggered ||
+                       (sys.mq135.reading - sys.mq135.baseline > DEV_ELEVATED) ||
+                       (sys.mq2.reading - sys.mq2.baseline > DEV_ELEVATED);
+    
+    bool tempHigh = sys.tempC > TEMP_THRESHOLD_C;
+    
+    if (gasElevated || tempHigh) {
+        sys.currentThreat = THREAT_CAUTION;
+        sys.confScore = 2;
+        
+        if (sys.previousThreat != THREAT_CAUTION) {
+            lcdDirty = true;
+            
+            Serial.println(F("\n╔════════════════════════════════════════╗"));
+            Serial.println(F("║  ⚠️ CAUTION STATE                      ║"));
+            Serial.println(F("║  Elevated gas/temperature              ║"));
+            Serial.println(F("║  Li-Fi → 0b10100 (WARNING Code 1010)   ║"));
+            Serial.println(F("╚════════════════════════════════════════╝"));
+            
+            String alert = "<b>⚠️ CAUTION ALERT</b>\n\n";
+            alert += "<b>Location:</b> " + String(ALERT_LOCATION) + "\n";
+            alert += "Elevated readings detected.\n\n";
+            if (sys.dhtValid) {
+                alert += "Temp: " + String(sys.tempC, 1) + "°C\n";
+            }
+            alert += "MQ135: " + String((int)sys.mq135.reading) + " (Δ" 
+                   + String((int)(sys.mq135.reading - sys.mq135.baseline)) + ")\n";
+            alert += "MQ2: " + String((int)sys.mq2.reading) + " (Δ" 
+                   + String((int)(sys.mq2.reading - sys.mq2.baseline)) + ")\n";
+            
+            sendTelegram(alert);
+            logEvent("CAUTION_TRIGGERED");
+        }
+        return;
+    }
+    
+    // ────── NORMAL STATE ──────
+    sys.currentThreat = THREAT_NORMAL;
+    sys.confScore = 1;
+    
+    if (sys.previousThreat != THREAT_NORMAL) {
+        lcdDirty = true;
+        lifi.allClearBurst = ALL_CLEAR_BURST_COUNT;
+        
+        Serial.println(F("\n╔════════════════════════════════════════╗"));
+        Serial.println(F("║  ✅ ALL CLEAR                          ║"));
+        Serial.println(F("║  Readings returned to normal           ║"));
+        Serial.println(F("║  Li-Fi → 0b10010 (ALL CLEAR Code 1001) ║"));
+        Serial.println(F("╚════════════════════════════════════════╝"));
+        
+        String alert = "<b>✅ ALL CLEAR</b>\n\n";
+        alert += "<b>Location:</b> " + String(ALERT_LOCATION) + "\n";
+        alert += "Readings returned to normal.\n";
+        alert += "Fan relay stopping at Receiver.\n";
+        alert += "Confidence: 1/4";
+        
+        sendTelegram(alert);
+        logEvent("NORMAL_RESTORED");
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   LCD DISPLAY
+   Only updates when state changes (dirty flag optimization)
+   ═══════════════════════════════════════════════════════════════════ */
+void updateDisplay() {
+    if (!lcdDirty) return;
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    
+    if (sys.manualEmergency) {
+        lcd.print(F("MANUAL EMERGENCY"));
+    } else {
+        switch (sys.currentThreat) {
+            case THREAT_EMERGENCY:
+                lcd.print(F("! EMERGENCY !"));
+                break;
+            case THREAT_CAUTION:
+                lcd.print(F("CAUTION     "));
+                break;
+            default:
+                lcd.print(F("NORMAL      "));
+                break;
+        }
+        lcd.print(sys.confScore);
+        lcd.print(F("/4"));
+    }
+    
+    lcd.setCursor(0, 1);
+    if (sys.flame.detected || sys.manualEmergency) {
+        lcd.print(F("FLAME DETECTED! "));
+    } else if (sys.dhtValid) {
+        char buffer[17];
+        snprintf(buffer, sizeof(buffer), "T:%.1fC H:%d%%", 
+                 sys.tempC, (int)sys.humidity);
+        lcd.print(buffer);
+    } else {
+        lcd.print(F("Sensor ERROR    "));
+    }
+    
+    lcdDirty = false;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   OUTPUT CONTROL
+   LEDs (status) + Buzzer (non-blocking patterns)
+   ═══════════════════════════════════════════════════════════════════ */
+void updateOutputs() {
+    ThreatLevel effectiveThreat = sys.manualEmergency ? THREAT_EMERGENCY : sys.currentThreat;
+    
+    // ────── LEDs ──────
+    digitalWrite(LED_GREEN,  effectiveThreat == THREAT_NORMAL    ? HIGH : LOW);
+    digitalWrite(LED_YELLOW, effectiveThreat == THREAT_CAUTION   ? HIGH : LOW);
+    // RED LED handled by blink function
+    
+    // ────── RED LED BLINK (Emergency only) ──────
+    if (effectiveThreat == THREAT_EMERGENCY) {
+        if (millis() - blinkLastMs >= 150) {
+            blinkLastMs = millis();
+            blinkState = !blinkState;
+            digitalWrite(LED_RED, blinkState ? HIGH : LOW);
+        }
+    } else {
+        digitalWrite(LED_RED, LOW);
+        blinkState = false;
+    }
+    
+    // ────── BUZZER (Non-blocking patterns) ──────
+    if (effectiveThreat == THREAT_NORMAL) {
+        digitalWrite(BUZZER_PIN, LOW);
+        buzzerState = false;
+        return;
+    }
+    
+    unsigned long onTime  = (effectiveThreat == THREAT_EMERGENCY) ? 100UL : 200UL;
+    unsigned long offTime = (effectiveThreat == THREAT_EMERGENCY) ? 100UL : 600UL;
+    unsigned long waitTime = buzzerState ? onTime : offTime;
+    
+    if (millis() - buzzerLastMs >= waitTime) {
+        buzzerLastMs = millis();
+        buzzerState = !buzzerState;
+        digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   HEARTBEAT MESSAGES
+   Periodic status update via Telegram (5 minutes)
+   ═══════════════════════════════════════════════════════════════════ */
+void sendHeartbeat() {
+    if (!wifiAvailable) return;
+    
+    unsigned long now = millis();
+    if (now - lastHeartbeat < HEARTBEAT_INTERVAL_MS) return;
+    
+    lastHeartbeat = now;
+    
+    String msg = "<b>💓 ARIA Heartbeat</b>\n\n";
+    msg += "<b>Location:</b> " + String(ALERT_LOCATION) + "\n";
+    msg += "<b>Status:</b> ";
+    if (sys.manualEmergency) msg += "MANUAL EMERGENCY\n";
+    else if (sys.currentThreat == THREAT_EMERGENCY) msg += "EMERGENCY\n";
+    else if (sys.currentThreat == THREAT_CAUTION) msg += "CAUTION\n";
+    else msg += "Normal\n";
+    
+    msg += "<b>Uptime:</b> " + String(millis() / 60000UL) + " min\n\n";
+    msg += "<b>Sensors:</b>\n";
+    if (sys.dhtValid) {
+        msg += "Temp: " + String(sys.tempC, 1) + "°C\n";
+        msg += "Humidity: " + String((int)sys.humidity) + "%\n";
+    }
+    msg += "MQ135: " + String((int)sys.mq135.reading) + " (Δ" 
+         + String((int)(sys.mq135.reading - sys.mq135.baseline)) + ")\n";
+    msg += "MQ2: " + String((int)sys.mq2.reading) + " (Δ" 
+         + String((int)(sys.mq2.reading - sys.mq2.baseline)) + ")\n";
+    msg += "Flame: " + String(sys.flame.detected ? "YES" : "No") + "\n";
+    msg += "Conf: " + String(sys.confScore) + "/4\n\n";
+    msg += "WiFi: " + String(WiFi.RSSI()) + " dBm\n";
+    msg += "Li-Fi Codes: 1000=HB, 1010=WARN, 1101=EMRG, 1001=CLR\n";
+    msg += "Relay: @ Receiver Unit";
+    
+    sendTelegram(msg);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SETUP
+   Initialize hardware, WiFi, FreeRTOS tasks, calibration
+   ═══════════════════════════════════════════════════════════════════ */
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+    
+    Serial.println(F("\n╔════════════════════════════════════════╗"));
+    Serial.println(F("║  ARIA v4.0.1 TRANSMITTER — ESP32       ║"));
+    Serial.println(F("║  5-bit Li-Fi | Temp Compensation       ║"));
+    Serial.println(F("║  Emergency Code: 1101 (CORRECTED)      ║"));
+    Serial.println(F("║  Relay Control @ Receiver Unit         ║"));
+    Serial.println(F("╚════════════════════════════════════════╝\n"));
+    
+    // ────── GPIO INITIALIZATION ──────
+    pinMode(LASER_PIN, OUTPUT);
+    digitalWrite(LASER_PIN, LOW);
+    
+    pinMode(EMERGENCY_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(FLAME_PIN, INPUT_PULLUP);
+    pinMode(MQ135_DO_PIN, INPUT_PULLUP);
+    pinMode(MQ2_DO_PIN, INPUT_PULLUP);
+    
+    for (int pin : {LED_GREEN, LED_YELLOW, LED_RED, BUZZER_PIN}) {
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, LOW);
+    }
+    
+    // ────── LCD INITIALIZATION ──────
+    lcd.init();
+    lcd.backlight();
+    lcd.clear();
+    lcd.print(F("ARIA v4.0.1 TX"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Code 1101 Fixed"));
+    delay(1500);
+    
+    // ────── DHT SENSOR ──────
+    dht.begin();
+    
+    // ────── FREERTOS QUEUE FOR TELEGRAM ──────
+    telegramQueue = xQueueCreate(5, sizeof(String));
+    
+    // Launch Telegram task on Core 0 (WiFi/HTTP operations)
+    xTaskCreatePinnedToCore(
+        telegramTask,      // Function
+        "TelegramTask",    // Name
+        4096,              // Stack size (bytes)
+        NULL,              // Parameters
+        1,                 // Priority
+        NULL,              // Task handle
+        0                  // Core 0 (Core 1 runs main loop)
+    );
+    
+    // ────── WI-FI CONNECTION ──────
+    lcd.clear();
+    lcd.print(F("WiFi scanning..."));
+    
+    wifiAvailable = connectToWiFi();
+    
+    if (wifiAvailable) {
+        // Start web server
+        server.on("/", handleWebRoot);
+        server.on("/data", handleWebData);
+        server.begin();
+        
+        lcd.setCursor(0, 1);
+        lcd.print(WiFi.localIP().toString().substring(0, 16));
+        delay(2000);
+        
+        Serial.print(F("[Web] Dashboard at http://"));
+        Serial.println(WiFi.localIP());
+    } else {
+        lcd.setCursor(0, 1);
+        lcd.print(F("WiFi FAILED     "));
+        delay(1500);
+    }
+    
+    // ────── BUZZER TEST ──────
+    testBuzzer();
+    
+    // ────── CALIBRATION ──────
+    runCalibration();
+    
+    // ────── INITIALIZATION COMPLETE ──────
+    sys.lastLoopMs = millis();
+    lastHeartbeat  = millis();
+    
+    lifi.cycleStartMs = millis();
+    lifi.phase = LIFI_IDLE;
+    
+    Serial.println(F("\n╔════════════════════════════════════════╗"));
+    Serial.println(F("║  ✅ ARIA TRANSMITTER ONLINE            ║"));
+    Serial.println(F("║  Li-Fi Codes (5-bit parity):           ║"));
+    Serial.println(F("║    1000 → Heartbeat (Normal)           ║"));
+    Serial.println(F("║    1010 → Warning (Caution)            ║"));
+    Serial.println(F("║    1101 → Emergency (FLAME/MANUAL)     ║"));
+    Serial.println(F("║    1001 → All Clear (Reset)            ║"));
+    Serial.println(F("║  Temperature compensation: ENABLED     ║"));
+    Serial.println(F("║  Relay control @ Receiver (Arduino)    ║"));
+    Serial.println(F("╚════════════════════════════════════════╝\n"));
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   MAIN LOOP (CORE 1)
+   Sensor reading, threat analysis, Li-Fi transmission, outputs
+   ═══════════════════════════════════════════════════════════════════ */
+void loop() {
+    // ────── BUTTON HANDLING (Always responsive) ──────
+    handleButtons();
+    
+    // ────── WEB SERVER (If WiFi available) ──────
+    if (wifiAvailable) {
+        server.handleClient();
+        
+        // Check connection status
+        if (WiFi.status() != WL_CONNECTED) {
+            wifiAvailable = false;
+            Serial.println(F("[WiFi] Connection lost"));
+        }
+    } else {
+        // Periodic reconnection attempts
+        static unsigned long lastReconnect = 0;
+        if (millis() - lastReconnect > WIFI_RECONNECT_MS) {
+            lastReconnect = millis();
+            if (connectToWiFi()) {
+                wifiAvailable = true;
+                server.begin();
+            }
+        }
+    }
+    
+    // ────── MAIN SENSOR LOOP (2-second interval) ──────
+    if (millis() - sys.lastLoopMs >= LOOP_INTERVAL_MS) {
+        sys.lastLoopMs = millis();
+        
+        readSensors();
+        analyzeThreats();
+        updateDisplay();
+        updateOutputs();
+        
+        // Periodic status print
+        Serial.printf("[STATUS] Threat=%s Conf=%d/4 Temp=%.1f°C Gas1=%d Gas2=%d Flame=%s LiFi=%s\n",
+                      sys.currentThreat == THREAT_EMERGENCY ? "EMRG" :
+                      sys.currentThreat == THREAT_CAUTION ? "CAUT" : "NORM",
+                      sys.confScore,
+                      sys.tempC,
+                      (int)sys.mq135.reading,
+                      (int)sys.mq2.reading,
+                      sys.flame.detected ? "YES" : "NO",
+                      sys.currentThreat == THREAT_EMERGENCY ? "1101" :
+                      sys.currentThreat == THREAT_CAUTION ? "1010" : "1000");
+    }
+    
+    // ────── LI-FI TRANSMITTER (Non-blocking state machine) ──────
+    runLiFiTransmitter();
+    
+    // ────── HEARTBEAT MESSAGES ──────
+    sendHeartbeat();
+}
